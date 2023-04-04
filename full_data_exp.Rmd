@@ -1,0 +1,111 @@
+---
+title: "new_data_exp"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(ggbeeswarm)
+library(zellkonverter)
+library(dplyr)
+library(scRNAseq)
+library(SingleCellExperiment)
+library(scran)
+library(scater)
+
+```
+
+```{r}
+sce_brain=readRDS('tm_brain.rds')
+source('PCA.r')
+source('utility.R')
+
+colnames(sce_brain)=sce_brain$ori_cell_id
+```
+
+
+```{r}
+n_folds=20
+
+uniform_random_test=function(sce, n_folds){
+  train_idx <- sample(ncol(sce), .66* ncol(sce), replace = FALSE)  
+  sce.bio_replicates<-unique(sce$bio_replicates) 
+  cell_batch_df = as.data.frame(colData(sce), optional = TRUE) %>% 
+    dplyr::select(bio_replicates, tissue, sex, age) %>% mutate(cell_idx = seq_along(sce$bio_replicates))
+  batch_df = cell_batch_df %>% dplyr::select(tissue, bio_replicates) %>% unique() %>% arrange(tissue) %>% mutate(fold = rep_len(seq(from = 1, to = n_folds), length(bio_replicates)))
+  cell_batch_df = left_join(cell_batch_df, batch_df, by = c('tissue', 'bio_replicates'))
+  fold_train = sample(n_folds, size = floor(.66 * n_folds), replace = FALSE)
+  cell_train = filter(cell_batch_df, fold %in% fold_train) %>% pull(cell_idx)
+  result=list(cell_batch_df, fold_train, cell_train)
+  return(result)
+} 
+
+
+cross_validation_batch=function(sce, n_folds){
+  cell_batch_df = uniform_random_test(sce, n_folds)[[1]]
+  cell_train = uniform_random_test(sce, n_folds)[[3]]
+  #stratified by batch
+  test_batch = split_and_label(sce, cell_train, dimred_test = 'PCA')
+  train_only = split_and_label(sce, seq_len(ncol(sce)), dimred_test = 'PCA')
+  concordance_stats=concordance_stats(ref = train_only$train[, -cell_train], query=test_batch$test)
+  return(concordance_stats)
+}
+
+
+
+permute_ite_plot=function(sce, n_folds){
+  cell_train = uniform_random_test(sce, n_folds)[[3]]
+  train_only = split_and_label(sce, seq_len(ncol(sce)), dimred_test = 'PCA')
+  #permute labels
+  uni_folds = data.frame(fold = sample(cell_batch_df$fold), cell_idx = seq_along(sce$bio_replicates))
+  uni_rsem = vfold_resample(sce, fold_map = uni_folds, train_args=NULL, return_train = 'tbl', return_test = 'tbl')
+  
+  #iterate over each batch as held-out data
+  batch_fold_stat_train = purrr::map_dfr(uni_rsem, function(fold){
+    x = fold$train
+    st = concordance_stats(train_only$train[, as.character(x$ori_cell_id)], x)
+    as_tibble(st[c('accuracy_rate', 'adj_RandIndex', 'test_nclust')])
+  }, .id = 'fold')
+  
+  #plot concordance between resampled training data
+  batch_fold_stat = purrr::map_dfr(rsem, function(fold){
+    x = fold$test
+    st = concordance_stats(train_only$train[, as.character(x$ori_cell_id)], x)
+    as_tibble(st[c('accuracy_rate', 'adj_RandIndex', 'test_nclust')])
+  }, .id = 'fold')
+  
+  uni_fold_stat =  purrr::map_dfr(uni_rsem, function(fold){
+    x = fold$test
+    st = concordance_stats(train_only$train[, as.character(x$ori_cell_id)], x)
+    as_tibble(st[c('accuracy_rate', 'adj_RandIndex', 'test_nclust')])
+  }, .id = 'fold')
+  
+  fold_stat = bind_rows(list(batch = batch_fold_stat, uniform = uni_fold_stat, stability = batch_fold_stat_train), .id = 'scheme') %>%
+    mutate(scheme = factor(scheme, levels = c('batch', 'uniform', 'stability')))
+  
+  plt = ggplot(fold_stat, aes(x = scheme, y = adj_RandIndex)) + 
+    geom_beeswarm() + 
+    theme_minimal() + 
+    stat_summary(color = 'red', lwd = .5) + xlab("Resampling Scheme")
+  plot_adi=plt + ylab("Adjusted Rand Index") 
+  plot_con=plt + aes(y = accuracy_rate) + ylab("Concordance")
+  plot_cluster=plt + aes(y = test_nclust) + ylab("# of clusters")
+  
+  return(list(fold_stat, plt, plot_adi, plot_con, plot_cluster))
+}
+
+
+
+uniform_random_test(sce = sce_brain, n_folds = n_folds)
+cross_validation_batch(sce = sce_brain, n_folds = n_folds)
+cell_batch_df = uniform_random_test(sce_brain, n_folds)[[1]]
+rsem = vfold_resample(sce=sce_brain, fold_map = cell_batch_df, return_train = 'tbl', return_test = 'tbl')
+permute_ite_plot(sce = sce_brain, n_folds = n_folds)
+
+
+```
+

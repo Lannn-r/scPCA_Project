@@ -1,0 +1,332 @@
+---
+title: "An approach to end-to-end cross-validation of clustering"
+author: "Lan Zhang and Andrew McDavid"
+output:
+  github_document
+params:
+  SingleCellExperiment_Class: sce.zeisel
+  number_of_uniform_resample: zeisel.col
+  printcode: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = params$printcode)
+knitr::opts_chunk$set(cache = TRUE, autodep = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(ggbeeswarm)
+library(dplyr)
+```
+
+
+## knit with parameters
+
+```{r, eval=FALSE}
+rmarkdown::render("function_projectPCA.Rmd", params = list(
+  SingleCellExperiment_Class=sce.zeisel,
+  number_of_uniform_resample=train_idx,
+  printcode = FALSE,
+  file = "parameter_function.html"
+))
+```
+
+
+
+## Loading and preprocessing data
+
+```{r}
+#--- loading ---#
+library(scRNAseq)
+sce.zeisel <- ZeiselBrainData()
+
+library(scater)
+sce.zeisel <- aggregateAcrossFeatures(sce.zeisel, 
+    id=sub("_loc[0-9]+$", "", rownames(sce.zeisel)))
+
+#--- gene-annotation ---#
+library(org.Mm.eg.db)
+rowData(sce.zeisel)$Ensembl <- mapIds(org.Mm.eg.db, 
+    keys=rownames(sce.zeisel), keytype="SYMBOL", column="ENSEMBL")
+
+#--- quality-control ---#
+stats <- perCellQCMetrics(sce.zeisel, subsets=list(
+    Mt=rowData(sce.zeisel)$featureType=="mito"))
+qc <- quickPerCellQC(stats, percent_subsets=c("altexps_ERCC_percent", 
+    "subsets_Mt_percent"))
+sce.zeisel <- sce.zeisel[,!qc$discard]
+
+#--- normalization ---#
+library(scran)
+set.seed(1000)
+clusters <- quickCluster(sce.zeisel)
+sce.zeisel <- computeSumFactors(sce.zeisel, cluster=clusters) 
+sce.zeisel <- logNormCounts(sce.zeisel)
+
+#--- variance-modelling ---#
+dec.zeisel <- modelGeneVarWithSpikes(sce.zeisel, "ERCC") 
+top.hvgs <- getTopHVGs(dec.zeisel, prop=0.1)
+```
+
+
+```{r}
+sce.zeisel
+```
+
+## Uniform-at-random test set (66% training)
+
+Import necessary functions, then generate training and testing data by randomly assigning columns from the whole data. Testing data contains 1/3 of all the data, and training data has 2/3 of the data. Applying trainPCA to train the original training data, and projecting this to test data to have trained testing data. Then encodes the whole dataset and store it to reducedDim. 
+
+```{r}
+source("PCA.r") 
+source('utility.R') 
+set.seed(50590) 
+train_idx <- sample(ncol(sce.zeisel), .66* ncol(sce.zeisel), replace = FALSE)
+```
+
+```{r}
+library(stringr)
+library(dplyr)
+zeisel.experimental.batch<-stringr::str_split_fixed(colData(sce.zeisel)$cell_id, "_", 2)[, 1]
+sce.zeisel$batch = zeisel.experimental.batch
+
+sce.zeisel$batch
+
+set.seed(50500) 
+zeisel.batch<-unique(sce.zeisel$batch) 
+length(zeisel.batch)
+
+cell_batch_df = as.data.frame(colData(sce.zeisel), optional = TRUE) %>% dplyr::select(batch, tissue, sex, age) %>% mutate(cell_idx = seq_along(zeisel.experimental.batch))
+```
+
+
+```{r}
+cell_batch_df %>% group_by(tissue) %>% summarize(n_distinct(batch))
+```
+
+~35 batches per tissue (and batch is nested within tissue).  We'll do 20 folds.
+
+```{r}
+n_folds = 20 
+batch_df = cell_batch_df %>% dplyr::select(tissue, batch) %>% unique() %>% slice_sample(prop = 1) %>% arrange(tissue) %>% mutate(fold = rep_len(seq(from = 1, to = n_folds), length(batch)))
+
+cell_batch_df = left_join(cell_batch_df, batch_df, by = c('tissue', 'batch'))
+
+fold_train = sample(n_folds, size = floor(.66 * n_folds), replace = FALSE)
+
+cell_train = filter(cell_batch_df, fold %in% fold_train) %>% pull(cell_idx) #filter all the rows, pull just gives the column index
+```
+
+
+```{r}
+test_train = split_and_label(sce.zeisel, train_idx, dimred_test = 'PCA')
+train_only = split_and_label(sce.zeisel, seq_len(ncol(sce.zeisel)), dimred_test = 'PCA')
+```
+
+1. Compare PCA projections using align_PCA
+
+```{r}
+reducedDim(test_train$test, name="modified test") = align_PCA(query = reducedDim(test_train$test, type="PCA"), reference = reducedDim(train_only$train[, -train_idx],type="PCA"))
+```
+
+2. Compare colLabels of `train_only$train[, -train_idx]` and `test_train$test`
+
+
+```{r}
+concordance_stats(ref = train_only$train[, -train_idx], query=test_train$test)
+```
+
+## Cross-validation, stratified by batch
+
+Create a dataframe including two columns: the first part of the cell ids and re-index them as the sequence they appeared in zeisel.experimental.batch. Next filter all the rows in batch_df, if there are cell ids in zeisel.experimental.batch belong to batched training data (overlaop with), then pull out the indices of those ids and collect them as cell_train. Repeat the same process for batch.test and collect all indices as cell_test.
+
+
+
+
+```{r}
+test_batch = split_and_label(sce.zeisel, cell_train, dimred_test = 'PCA')
+concordance_stats(ref = train_only$train[, -cell_train], query=test_batch$test)
+```
+
+
+## Full cross-validation by batch
+
+This takes quite a while to run
+
+```{r}
+rsem = vfold_resample(sce.zeisel, fold_map = cell_batch_df, return_train = 'tbl', return_test = 'tbl')
+```
+
+
+
+permute the fold labels with batch_df so that labels are not correspond with batch
+
+```{r}
+uni_folds = data.frame(fold = sample(cell_batch_df$fold), cell_idx = seq_along(zeisel.experimental.batch))
+
+uni_rsem = vfold_resample(sce.zeisel, fold_map = uni_folds, return_train = 'tbl', return_test = 'tbl')
+```
+
+Iterate over each batch as held-out test data
+
+
+```{r}
+batch_fold_stat_train = purrr::map_dfr(uni_rsem, function(fold){
+  x = fold$train
+  st = concordance_stats(colData(train_only$train[, x$cell_id]), x)
+  as_tibble(st[c('accuracy_rate', 'adj_RandIndex', 'test_nclust')])
+}, .id = 'fold')
+
+```
+
+Look at concordance within resampled training data (ala cluster stability)
+
+```{r cv-sheme-comparison, dev = c('png', 'pdf'), fig.width=4, fig.height = 4}
+batch_fold_stat = purrr::map_dfr(rsem, function(fold){
+  x = fold$test
+  st = concordance_stats(train_only$train[,x$cell_id], x)
+  as_tibble(st[c('accuracy_rate', 'adj_RandIndex', 'test_nclust')])
+}, .id = 'fold')
+
+uni_fold_stat =  purrr::map_dfr(uni_rsem, function(fold){
+  x = fold$test
+  st = concordance_stats(train_only$train[,x$cell_id], x)
+  as_tibble(st[c('accuracy_rate', 'adj_RandIndex', 'test_nclust')])
+}, .id = 'fold')
+
+fold_stat = bind_rows(list(batch = batch_fold_stat, uniform = uni_fold_stat, stability = batch_fold_stat_train), .id = 'scheme') %>%
+  mutate(scheme = factor(scheme, levels = c('batch', 'uniform', 'stability')))
+
+plt = ggplot(fold_stat, aes(x = scheme, y = adj_RandIndex)) + 
+  geom_beeswarm() + 
+  theme_minimal() + 
+  stat_summary(color = 'red', lwd = .5) + xlab("Resampling Scheme")
+plt + ylab("Adjusted Rand Index") 
+
+plt + aes(y = accuracy_rate) + ylab("Concordance")
+
+plt + aes(y = test_nclust) + ylab("# of clusters")
+```
+
+Get the concordance states for each fold and plot.
+
+Note the outliers by RandIndex -- are these the influential batches?
+
+
+
+Project zeisel.train to itself and name it as 'test PCA'. Plot the PCA result of training data and the first two PCs in the PCA result of the training data. Also show the cells corresponding to the 1/3 columns of all data. Then plot whole PCA result of the training data, and also the first two PCs in the PCA result. Calculate the row and column sums and means for the square of the differences (change all the differences to be positive) between the first two columns (PCs) of testing data and all data. This result gives the difference between the data contained under the name test PCA and PCA, which is the difference between results from the PCA on original training data and the result from the PCA on trained training data.
+
+```{r UMAP-all}
+train_only$train = runUMAP(train_only$train)
+plotReducedDim(train_only$train, 'UMAP', colour_by = 'level1class')
+plotReducedDim(train_only$train, 'UMAP', colour_by = 'label')
+
+plotReducedDim(train_only$train, 'UMAP', colour_by = 'batch') + theme(legend.pos = 'none')
+
+```
+
+
+```{r, cache = FALSE}
+knitr::knit_exit()
+```
+
+
+```{r, error=TRUE} 
+
+zeisel.train <- projectPCA(zeisel.train, zeisel.train, name="test PCA")
+
+
+plot(reducedDim(zeisel.train$sce.runpca, type="test PCA")) 
+plot(reducedDim(zeisel.train$sce.runpca, type="PCA")[, 1], reducedDim(zeisel.train$sce.runpca, type="PCA")[, 2], col="red") 
+plot(zeisel.all.projection[zeisel.col, ])
+
+plot(reducedDim(zeisel.train, type="test PCA"))
+points(reducedDim(zeisel.train, type="PCA")[, 1], reducedDim(zeisel.train, type="PCA")[, 2], col="red")
+
+colSums((reducedDim(zeisel.train, 'PCA')[,1:2] - reducedDim(zeisel.train, 'test PCA')[,1:2])^2)
+```
+
+
+Perform PCA on testing data using the model of all data. Plot the PCA result of this testing data to see what's inside. Then perform PCA on testing data using the training data model, and plot the result to see what it contains. Then combine two graphics together to get a better look at it. Then concatenate the rows of reducedDim of training and testing data, coloring the points of PCs to show which data group they belong to (belong to trained training data or trained testing data).
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+
+zeisel.test<-projectPCA(zeisel.test, sce.zeisel, name="PCA all")
+plot(reducedDim(zeisel.test, type = "PCA all")) #plot the effect on the cells in sce.test on the PCA using all data inside sce.zeisel
+zeisel.test<-projectPCA(zeisel.test, zeisel.train, name="PCA train")
+plot(reducedDim(zeisel.test, type="PCA train")) #plot the effect on the cells in sce.test on the PCA using training data
+
+
+#reproduce the plot and fix the problems
+zeisel.test.data<-bind_rows(data.frame(reducedDim(zeisel.test, type = "PCA all")), data.frame(reducedDim(zeisel.test, type="PCA train")), .id="Group") #combined two plots to one
+ggplot(zeisel.test.data, aes(PC1, PC2, colour=Group))+
+  geom_point(alpha=0.5) 
+
+#plot PC1 and PC2, using point plot or ggplot, indicate which elements belongs to which data(plot in the same coordinate to compare)
+zeisel.data<-bind_rows(data.frame(reducedDim(zeisel.train)), 
+data.frame(reducedDim(zeisel.test)), .id = "Group")
+ggplot(zeisel.data, aes(PC1, PC2, colour=Group))+
+  geom_point()+
+  scale_color_manual(labels = c("zeisel.train", "zeisel.test"), values = c("orange", "blue"))
+```
+
+
+## Now, stratify by batch
+
+Split all data (sce.zeisel) by its cell ids, checking where inside the cell ids have "_", then split it to two groups, and show the first part of the cell id aftering spliting the data. Then remove the duplicate elements inside zeisel.experimental.batch as the zeisel.batch, regard this as the stratified data. Check the length of it to see how many elements lost. Next randomly sampled 2/3 of the zeisel.batch as batch training data; check the difference between all batch data and training data to assign the left 1/3 of the columns of all data as batch testing data. Finally check there is no overlap between training data and testing data.
+
+
+## Get corresponding cell ids for train/test batch
+
+Split testing and training data by different cell ids, then train the splited training data and extract the PCA result as the new batch training data. Next perform PCA on splited testing data that was projected by all data, name it as "batch test". 
+
+```{r}
+zeisel.batch.test<-sce.zeisel[, cell_test]
+zeisel.batch.train<-sce.zeisel[, cell_train]
+batch.train.pca<-trainPCA(zeisel.batch.train) 
+zeisel.batch.train<-batch.train.pca$sce.runpca #note: batch.train.pca doesn't have PCA result
+batch.all<-projectPCA(zeisel.batch.test, sce.zeisel, name="batch test")
+```
+
+
+Perform PCA on batched testing data that was projected by batched training data, and name it as "batch PCA". Plot it to see the effect on the cells in testing data on the PCA using batched training data; Also see the effect on cells in training data on the PCA using training data. This is used to compare top PCs in training and testing data.
+
+```{r, error=TRUE}
+#PC1 vs PC2 test data using training data
+batch.test.pca<-projectPCA(zeisel.batch.test, batch.train.pca, name="batch PCA")
+plot(reducedDim(batch.test.pca, type="batch PCA") ) 
+#PC1 vs PC2 train data using training data 
+batch.train<-projectPCA(zeisel.batch.train, batch.train.pca, name="PCA") 
+plot(reducedDim(batch.train, type = "PCA"))
+```
+
+
+Plot the testing data that was clustered by all data and its labels; then plot the testing data clustered by training data and all the labels.
+
+```{r}
+library(bluster)
+
+#plot the effect on the cells in sce.test on clustering using all data 
+cluster.test<-clusterRows(reducedDim(batch.all, "batch test"), NNGraphParam())
+colLabels(batch.all)<-factor(cluster.test)
+plotReducedDim(batch.all, "batch test", colour_by = "label")
+
+#plot the effect on the cells in sce.test on clustering using training data
+cluster.test<-clusterRows(reducedDim(batch.test.pca, "batch PCA"), NNGraphParam())
+colLabels(batch.test.pca)<-factor(cluster.test)
+plotReducedDim(batch.test.pca, "batch PCA", colour_by = "label")
+
+```
+
+
+If the diagonal of the correlation between test on all data and on training data is negative, flip the sign of tesing based on all data to maximize the concordance between two data, and store the modified testing data to a new one named "PCA all align".
+
+```{r}
+reducedDim(zeisel.test, name="PCA all align")=align_PCA(query = reducedDim(zeisel.test, type = "PCA all"), 
+          reference = reducedDim(zeisel.test, type = "PCA train"))
+```
+
